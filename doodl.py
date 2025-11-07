@@ -11,6 +11,16 @@ from fgvc_ws_dan_helpers.inception_bap import inception_v3_bap
 from os.path import expanduser  
 from urllib.request import urlretrieve  
 import open_clip
+import torch.nn.functional as F
+from torch.cuda.amp import autocast
+from tqdm import tqdm
+from PIL import Image
+import torchvision
+import numpy as np
+import random
+import torch
+import os
+import csv
 
 
 torch.autograd.set_detect_anomaly(False)
@@ -321,23 +331,15 @@ def clip_loss_fn(prompt=None,
 
 def symmetry_loss_fn(symmetry_type, grad_scale=0):
     """
-    Fun throw-in, works sometimes. Make generation have horizontal symmetry
-    Probably want perturb_grad_scale=0 for this one and high grad_scale
-    Didn't do formal experimentation with
+    Fun throw-in: enforce symmetry (currently only 'horizontal').
     """
     def loss_fn(im_pix):
-        
         if symmetry_type == 'horizontal':
-            loss = F.mse_loss(im_pix, im_pix.flip(-1)) # could make L1
+            loss = F.mse_loss(im_pix, im_pix.flip(-1))  # could make L1
         else:
             raise NotImplementedError
-
         return grad_scale * loss
-
     return loss_fn
-
-
-
 def fgvc_loss_fn(dataset,
                    class_idx=0,
                  use_cutouts=False,
@@ -416,7 +418,7 @@ def get_generic_cond_fn(loss_fn,
     * Backpropagates loss through denoising process to get grad w.r.t latents
     
     Args:
-    * loss_fn: function with torch pixels in --> scalaar loss out
+    * loss_fn: function with torch pixels in --> scalar loss out
     * embedding_(un)conditional: SD embeddings as standard in diffusers
     * sd_guidance_scale: classifier free guidance scale
     * steps: Number diffusion timesteps
@@ -644,6 +646,70 @@ def aesthetic_loss_fn(aesthetic_target=None,
 
 
 
+
+import torch.nn.functional as F
+
+def mechint_loss_fn(
+    *,
+    masked_model_modal,
+    target_idx: int,
+    project_activations,
+    subspace,
+    unit_probe: torch.Tensor,
+    preprocess_to_bcos=None,
+    lpips_model=None,
+    ref_im_pix_minus1_1=None,
+    token_agg: str = "cls",
+    weights: dict = None,
+    grad_scale: float = 1.0
+):
+    # weights apply ONLY to gradient contribution; we log RAW terms separately
+    w = {'ce':1.0,'probe':1.0,'lpips':0.0}
+    if weights: w.update(weights)
+
+    def _default_preprocess(x_m11):
+        # x in [-1,1] -> [0,1]; replace if your model expects [-1,1]
+        return (x_m11.clamp(-1,1) + 1.0) * 0.5
+
+    preprocess = preprocess_to_bcos or _default_preprocess
+    target = torch.tensor([target_idx], device=device, dtype=torch.long)
+
+    # attach a dict for last raw metrics
+    def loss_fn(im_pix):  # im_pix is in [-1,1]
+        # (1) CE (raw)
+        x_for_bcos = preprocess(im_pix, data_range=(-1, 1))
+        logits, acts = masked_model_modal(x_for_bcos, return_acts=True)
+        ce_raw = F.cross_entropy(logits, target)
+        with torch.no_grad():
+            probs = torch.softmax(logits.float(), dim=1)
+            target_prob = probs[0, target_idx].clamp(0,1)
+
+        # (2) Probe alignment (raw, maximize)
+        z0 = project_activations(acts, subspace, method=token_agg)[0]
+        alignment_raw = torch.dot(z0, unit_probe)        # we want this to go UP
+        probe_loss = -alignment_raw                      # loss to minimize
+
+        # (3a) LPIPS (raw)
+        lpips_raw = torch.zeros((), device=im_pix.device, dtype=im_pix.dtype)
+        if (lpips_model is not None) and (ref_im_pix_minus1_1 is not None):
+            lpips_raw = lpips_model(im_pix, ref_im_pix_minus1_1).mean()
+
+        # store raw metrics for logging (no weights, no grad_scale)
+        loss_fn._last_terms = {
+            'ce': float(ce_raw.detach().cpu()),
+            'alignment': float(alignment_raw.detach().cpu()),
+            'lpips': float(lpips_raw.detach().cpu()),
+            'target_prob': float(target_prob.detach().cpu()),
+        }
+
+        # weighted scalar loss (for gradients)
+        total = (w['ce']*ce_raw + w['probe']*probe_loss + w['lpips']*lpips_raw)
+        return grad_scale * total
+
+    loss_fn._last_terms = {}
+    return loss_fn
+
+
 def gen(
     cond_prompt = 'a dog',
     model_guidance_type = 'CLIP', # CLIP or imagenet or .... or .. 
@@ -787,6 +853,34 @@ def gen(
             loss_fn = symmetry_loss_fn(symmetry_type=model_guidance_dict.get('symmetry_type',
                                                                                   'horizontal'),
                                           grad_scale=grad_scale)
+
+        elif model_guidance_type=='custom_mechint':
+            # Build optional ref image tensor ([-1,1]) for LPIPS if provided
+            ref_im_pix = None
+            if model_guidance_dict.get('ref_tensor_m11') is not None:
+                ref_im_pix = model_guidance_dict['ref_tensor_m11'].to(device).to(unet.dtype)
+            elif model_guidance_dict.get('ref_image_path') is not None:
+                ref_im = load_im_into_format_from_path(model_guidance_dict['ref_image_path'])
+                ref_im = ref_im.resize((512, 512), resample=Image.Resampling.LANCZOS if hasattr(Image,'Resampling') else Image.LANCZOS)
+                ref_im = np.array(ref_im) / 255.0 * 2.0 - 1.0
+                ref_im = torch.from_numpy(ref_im[np.newaxis, ...].transpose(0,3,1,2)).to(device).to(unet.dtype)
+                if ref_im.shape[1] > 3:
+                    ref_im = ref_im[:, :3] * ref_im[:, 3:] + (1 - ref_im[:, 3:])
+                ref_im_pix = ref_im
+
+            loss_fn = mechint_loss_fn(
+                masked_model_modal = model_guidance_dict['masked_model_modal'],
+                target_idx         = model_guidance_dict['target_idx'],
+                project_activations= model_guidance_dict['project_activations'],
+                subspace           = model_guidance_dict['subspace'],
+                unit_probe         = model_guidance_dict['unit_probe'],
+                preprocess_to_bcos = model_guidance_dict.get('preprocess_to_bcos', None),
+                lpips_model        = model_guidance_dict.get('lpips_model', None),
+                ref_im_pix_minus1_1= ref_im_pix,
+                token_agg          = model_guidance_dict.get('token_agg', 'cls'),
+                weights            = model_guidance_dict.get('weights', {'ce':1.0,'probe':1.0,'lpips':0.0}),
+                grad_scale         = grad_scale
+            )
         else:
             raise NotImplementedError
         
@@ -852,7 +946,7 @@ def gen(
                 init_latent = vae.encode(source_im).latent_dist.sample(generator=generator) * 0.18215
  
                 latent_pair = init_latent.repeat(2, 1, 1, 1)
-                # Iterate through reversed tiemsteps using EDICT
+                # Iterate through reversed timesteps using EDICT
                 for i, t in tqdm(enumerate(timesteps.flip(0)), total=len(timesteps)):
                     i = torch.tensor([i],
                                      dtype=torch_dtype,
@@ -879,7 +973,7 @@ def gen(
                                      device=latent_pair.device)
                     i, t, latent_pair = s(i, t, latent_pair)
                     latent_pair = mix(latent_pair)
-            # will have drifted with above in EDICT, this might corrupt image at intermediate noise levvels
+            # will have drifted with above in EDICT, this might corrupt image at intermediate noise levels
             if tied_latents: 
                 combined_l = 0.5 * (latent_pair[0] + latent_pair[1])
                 latent_pair = combined_l.repeat(2, 1, 1, 1)
@@ -890,6 +984,9 @@ def gen(
         """
         # turn on gradient calculation
         with torch.enable_grad(): # important b/c don't have on by default in module
+            metrics_path = f"ims/{save_str.replace('.png','_metrics.csv') if save_str else 'metrics.csv'}"
+            os.makedirs('ims', exist_ok=True)
+            latent_ref_anchor = latent_pair.detach().clone()
             for m in range(num_traversal_steps): # This is # of optimization steps
                 print(f"Optimization Step {m}")
                 
@@ -931,6 +1028,36 @@ def gen(
                         losses.append(loss)
                         if optimize_first_edict_image_only: break
                 sum_loss = sum(losses)
+                # latent prior anti-drift (only when using custom_mechint)
+                prior_loss = torch.zeros((), device=orig_latent_pair.device, dtype=orig_latent_pair.dtype)
+                if model_guidance_type == 'custom_mechint':
+                    lpw = model_guidance_dict.get('latent_prior_weight', 0.0)
+                    if lpw:
+                        sigma = model_guidance_dict.get('latent_sigma', 1.0)
+                        prior_loss = ((orig_latent_pair - latent_ref_anchor) / (sigma + 1e-6)).pow(2).mean()
+                        sum_loss = sum_loss + lpw * prior_loss
+
+                # ===== Metrics logging (raw, unweighted terms) =====
+                try:
+                    # take the last computed raw terms from loss_fn (first EDICT image's call)
+                    terms = getattr(loss_fn, "_last_terms", {})
+                    ce_val       = float(terms.get('ce', float('nan')))
+                    align_val    = float(terms.get('alignment', float('nan')))
+                    lpips_val    = float(terms.get('lpips', float('nan')))
+                    target_prob  = float(terms.get('target_prob', float('nan')))
+                    prior_val    = float(prior_loss.detach().cpu())
+                    total_val    = float(sum_loss.detach().cpu())
+                    write_header = not os.path.exists(metrics_path)
+                    with open(metrics_path, 'a', newline='') as f:
+                        w = csv.writer(f)
+                        if write_header:
+                            w.writerow(['step','ce','alignment','lpips','prior','target_prob','total_loss'])
+                        w.writerow([m, ce_val, align_val, lpips_val, prior_val, target_prob, total_val])
+                    if (m % 5) == 0:
+                        print(f"[step {m}] CE={ce_val:.4f} align={align_val:.4f} LPIPS={lpips_val:.4f} prior={prior_val:.4f} prob={target_prob:.3f} total={total_val:.4f}")
+                except Exception as _e:
+                    print('metrics logging error:', _e)
+
                 
                 # Backward pass
                 sum_loss.backward()
