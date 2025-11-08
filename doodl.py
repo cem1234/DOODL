@@ -6,6 +6,7 @@ import memcnn
 from transformers import AutoProcessor, AutoModel
 import sys
 from torchvision import transforms
+from torchvision.transforms.functional import InterpolationMode
 from fgvc_ws_dan_helpers.inception_bap import inception_v3_bap
 
 from os.path import expanduser  
