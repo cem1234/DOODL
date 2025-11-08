@@ -140,8 +140,29 @@ clip_model = CLIPModel.from_pretrained(model_path_clip, torch_dtype=torch_dtype)
 clip = clip_model.text_model
 
 # HF authentication
-with open('hf_auth', 'r') as f:
-    auth_token = f.readlines()[0].strip()
+import os
+auth_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+
+if not auth_token:
+    try:
+        with open("hf_auth", "r") as f:
+            auth_token = f.readline().strip()
+    except FileNotFoundError:
+        auth_token = None
+
+if not auth_token:
+    try:
+        from huggingface_hub import HfFolder
+        auth_token = HfFolder.get_token()
+    except Exception:
+        auth_token = None
+
+if not auth_token:
+    raise FileNotFoundError(
+        "No Hugging Face token found. Set HF_TOKEN env var, create a file 'hf_auth' "
+        "with your token, or run `from huggingface_hub import login; login()`."
+    )
+    
 
 # Using SD 1.4
 model_path_diffusion = "CompVis/stable-diffusion-v1-4"
