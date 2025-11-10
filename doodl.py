@@ -12,7 +12,7 @@ from os.path import expanduser
 from urllib.request import urlretrieve  
 import open_clip
 import torch.nn.functional as F
-from torch.cuda.amp import autocast
+import torch  # use torch.autocast('cuda', dtype=torch_dtype)
 from tqdm import tqdm
 from PIL import Image
 import torchvision
@@ -275,7 +275,7 @@ def clip_loss_fn(prompt=None,
                            for guiding_clip_tokenizer in guiding_clip_tokenizers]
             feed_text_inputs = [text_input.input_ids.to(guiding_clip_model.device)# .long()
                                for text_input in text_inputs]
-            with autocast(device):
+            with torch.autocast('cuda', dtype=torch_dtype):
                 z_ts = [guiding_clip_model.get_text_features(feed_text_input)[0]
                        for feed_text_input in feed_text_inputs]
             z_ts = [z_t / z_t.norm(p=2, dim=-1, keepdim=True)
@@ -390,7 +390,7 @@ def fgvc_loss_fn(dataset,
             x_var = torchvision.transforms.Resize(target_size)(im_pix)
         x_var = normalize(x_var).to(vae.dtype)
         
-        with autocast(device):
+        with torch.autocast('cuda', dtype=torch_dtype):
             # last output is actual classification output, basic recognition objective
             _, _, output = net(x_var)
         # target is class idx
@@ -461,7 +461,7 @@ def get_generic_cond_fn(loss_fn,
             latent_pair = torch.cat([input_latent.clone(), input_latent.clone()])
             
         # Just run diffusion
-        with autocast(device):
+        with torch.autocast('cuda', dtype=torch_dtype):
             for i, t in tqdm(enumerate(timesteps[start_i:]), total=len(timesteps)-start_i,
                             disable=True):
                 # get timestep indexing
@@ -563,7 +563,7 @@ def aesthetic_score(image, model, amodel):
     Output:
     * Single scalar score
     """
-    with autocast(device):
+    with torch.autocast('cuda', dtype=torch_dtype):
         image_features = model.encode_image(image)
         image_features /= image_features.norm(dim=-1, keepdim=True)
         prediction = amodel(image_features).clip(1, 10).mean()
@@ -800,7 +800,7 @@ def gen(
     random.seed(seed)
     
     # Text embedding setup
-    with autocast(device):
+    with torch.autocast('cuda', dtype=torch_dtype):
         tokens_unconditional = clip_tokenizer(null_prompt, padding="max_length",
                                               max_length=clip_tokenizer.model_max_length,
                                               truncation=True, return_tensors="pt", 
@@ -942,7 +942,7 @@ def gen(
             source_im = source_im.to(device).to(unet.dtype)
             
             # Peform reverse diffusion process
-            with autocast(device):
+            with torch.autocast('cuda', dtype=torch_dtype):
                 init_latent = vae.encode(source_im).latent_dist.sample(generator=generator) * 0.18215
  
                 latent_pair = init_latent.repeat(2, 1, 1, 1)
@@ -962,7 +962,7 @@ def gen(
             # Denoise T - opt_t diffusion timesteps before optimizing
             initial_timesteps = timesteps[:-1*opt_t] if opt_t!=0 else timesteps
             timesteps = timesteps[-1*opt_t:] if opt_t !=0 else []
-            with autocast(device):
+            with torch.autocast('cuda', dtype=torch_dtype):
                 for i, t in tqdm(enumerate(initial_timesteps),
                                  total=len(initial_timesteps)):
                     i = torch.tensor([i],
@@ -994,7 +994,7 @@ def gen(
                 orig_latent_pair = latent_pair.clone().detach().requires_grad_(True)
                 input_latent_pair = orig_latent_pair.clone()
                 # Full-chain generation using EDICCT
-                with autocast(device):
+                with torch.autocast('cuda', dtype=torch_dtype):
                     for i, t in tqdm(enumerate(timesteps), total=len(timesteps)):
                         i = torch.tensor([i],
                                          dtype=torch_dtype,
@@ -1142,7 +1142,7 @@ def gen(
             if source_im.shape[1] > 3:
                 source_im = source_im[:, :3] * source_im[:, 3:] + (1 - source_im[:, 3:])
             source_im = source_im.to(device).to(unet.dtype)
-            with autocast(device):
+            with torch.autocast('cuda', dtype=torch_dtype):
                 init_latent = vae.encode(source_im).latent_dist.sample(generator=generator) * 0.18215
  
                 latent_pair = init_latent.repeat(2, 1, 1, 1)
@@ -1169,7 +1169,7 @@ def gen(
         s = memcnn.InvertibleModuleWrapper(s, keep_input=keep_input,
                                            keep_input_inverse=keep_input,)
         # simply do the diffusion process, the conditioning function of s incorporates guidance
-        with autocast(device):
+        with torch.autocast('cuda', dtype=torch_dtype):
             for i, t in tqdm(enumerate(timesteps), total=len(timesteps)):
                 i = torch.tensor([i], dtype=torch_dtype, device=latent_pair.device)
                 t = torch.tensor([t], dtype=torch_dtype, device=latent_pair.device)
