@@ -1037,7 +1037,8 @@ def gen(
                         prior_loss = ((orig_latent_pair - latent_ref_anchor) / (sigma + 1e-6)).pow(2).mean()
                         sum_loss = sum_loss + lpw * prior_loss
 
-                # ===== Metrics logging (raw terms + weighted contributions + grad stats) =====
+                
+                # ===== Metrics logging (raw terms + weighted contributions; no grad preview here) =====
                 try:
                     # Raw (unweighted) terms from the custom loss' last call
                     terms = getattr(loss_fn, "_last_terms", {})
@@ -1048,7 +1049,7 @@ def gen(
                     prior_val    = float(prior_loss.detach().cpu())
                     total_val    = float(sum_loss.detach().cpu())
 
-                    # Append RAW terms CSV (preserves your existing header/format)
+                    # Append RAW terms CSV (keeps your existing schema)
                     write_header = not os.path.exists(metrics_path)
                     with open(metrics_path, 'a', newline='') as f:
                         w = csv.writer(f)
@@ -1056,8 +1057,7 @@ def gen(
                             w.writerow(['step','ce','alignment','lpips','prior','target_prob','total_loss'])
                         w.writerow([m, ce_val, align_val, lpips_val, prior_val, target_prob, total_val])
 
-                    # Weighted contributions to the optimized scalar
-                    #   total ≈ w_ce*CE + w_probe*(-alignment) + w_lpips*LPIPS + w_prior*prior
+                    # Weighted contributions to the optimized scalar (cached for post-backward logging)
                     weights_cfg = model_guidance_dict.get('weights', {'ce':1.0,'probe':1.0,'lpips':0.0})
                     w_ce    = float(weights_cfg.get('ce', 1.0))
                     w_probe = float(weights_cfg.get('probe', 1.0))
@@ -1065,48 +1065,72 @@ def gen(
                     w_prior = float(model_guidance_dict.get('latent_prior_weight', 0.0))
 
                     contrib_ce    = w_ce    * ce_val
-                    contrib_probe = w_probe * (-align_val)   # note sign flip
+                    contrib_probe = w_probe * (-align_val)   # note sign flip because we *maximize* alignment
                     contrib_lpips = w_lpips * lpips_val
                     contrib_prior = w_prior * prior_val
                     contrib_total = contrib_ce + contrib_probe + contrib_lpips + contrib_prior
 
-                    # ---- Preview grad stats BEFORE we do the real backward() ----
-                    # This does not modify your later update; retain_graph keeps the graph for backward().
-                    g_preview = torch.autograd.grad(
-                        sum_loss, orig_latent_pair, retain_graph=True, allow_unused=True
-                    )[0]
-                    if g_preview is not None:
-                        grad_norm = float(g_preview.norm().detach().cpu())
-                        grad_max  = float(g_preview.abs().max().detach().cpu())
-                    else:
-                        grad_norm, grad_max = float('nan'), float('nan')
-
-                    # Separate contributions CSV (augmented with grad stats)
-                    contrib_path = metrics_path.replace(".csv", "_contribs.csv")
-                    write_header_c = not os.path.exists(contrib_path)
-                    with open(contrib_path, 'a', newline='') as f2:
-                        w2 = csv.writer(f2)
-                        if write_header_c:
-                            w2.writerow(['step','w*CE','w*probe(-align)','w*LPIPS','w*prior','contrib_total','grad_norm','grad_maxabs'])
-                        w2.writerow([m, contrib_ce, contrib_probe, contrib_lpips, contrib_prior, contrib_total, grad_norm, grad_max])
-
-                    # Console print (every 2 steps): raw + contributions + grad stats
-                    if (m % 2) == 0:
-                        print(
-                            "[step %d] raw:     CE=%.3e  align=%.3e  LPIPS=%.3e  prior=%.3e  prob=%.3f  total=%.3e"
-                            % (m, ce_val, align_val, lpips_val, prior_val, target_prob, total_val)
-                        )
-                        print(
-                            "           contrib: w*CE=%.3e  w*probe=%.3e  w*LPIPS=%.3e  w*prior=%.3e  total=%.3e  | grad: ||g||=%.3e  max|g|=%.3e"
-                            % (contrib_ce, contrib_probe, contrib_lpips, contrib_prior, contrib_total, grad_norm, grad_max)
-                        )
+                    # cache for post-backward (grad stats)
+                    _contrib_cache = {
+                        'm': m,
+                        'contrib_ce': contrib_ce,
+                        'contrib_probe': contrib_probe,
+                        'contrib_lpips': contrib_lpips,
+                        'contrib_prior': contrib_prior,
+                        'contrib_total': contrib_total,
+                        'ce_val': ce_val,
+                        'align_val': align_val,
+                        'lpips_val': lpips_val,
+                        'prior_val': prior_val,
+                        'target_prob': target_prob,
+                        'total_val': total_val,
+                    }
                 except Exception as _e:
-                    print('metrics logging error:', _e)
-
+                    print('metrics logging error (pre-backward):', _e)
 
                 
                 # Backward pass
                 sum_loss.backward()
+
+                
+                # ===== Post-backward: gradient stats + contributions CSV + console print =====
+                try:
+                    # Gradient w.r.t. the trainable latents now exists
+                    g = orig_latent_pair.grad
+                    if g is not None:
+                        grad_norm = float(g.norm().detach().cpu())
+                        grad_max  = float(g.abs().max().detach().cpu())
+                    else:
+                        grad_norm, grad_max = float('nan'), float('nan')
+
+                    # Pull cached contributions (from the pre-backward block)
+                    c = locals().get('_contrib_cache', None)
+                    if c is not None:
+                        m = c['m']
+                        contrib_path = metrics_path.replace(".csv", "_contribs.csv")
+                        write_header_c = not os.path.exists(contrib_path)
+                        with open(contrib_path, 'a', newline='') as f2:
+                            w2 = csv.writer(f2)
+                            if write_header_c:
+                                w2.writerow(['step','w*CE','w*probe(-align)','w*LPIPS','w*prior','contrib_total','grad_norm','grad_maxabs'])
+                            w2.writerow([m, c['contrib_ce'], c['contrib_probe'], c['contrib_lpips'], c['contrib_prior'],
+                                         c['contrib_total'], grad_norm, grad_max])
+
+                        # Console print every 2 steps: raw + contributions + grad stats (scientific notation)
+                        if (m % 2) == 0:
+                            print(
+                                "[step %d] raw:     CE=%.3e  align=%.3e  LPIPS=%.3e  prior=%.3e  prob=%.3f  total=%.3e"
+                                % (m, c['ce_val'], c['align_val'], c['lpips_val'], c['prior_val'], c['target_prob'], c['total_val'])
+                            )
+                            print(
+                                "           contrib: w*CE=%.3e  w*probe=%.3e  w*LPIPS=%.3e  w*prior=%.3e  total=%.3e  | grad: ||g||=%.3e  max|g|=%.3e"
+                                % (c['contrib_ce'], c['contrib_probe'], c['contrib_lpips'], c['contrib_prior'],
+                                   c['contrib_total'], grad_norm, grad_max)
+                            )
+                except Exception as _e:
+                    print('metrics logging error (post-backward):', _e)
+
+                
                 # Access latent gradient directly
                 grad = -0.5 * orig_latent_pair.grad
                 # Average gradients if tied_latents
