@@ -1053,7 +1053,7 @@ def gen(
                         if write_header:
                             w.writerow(['step','ce','alignment','lpips','prior','target_prob','total_loss'])
                         w.writerow([m, ce_val, align_val, lpips_val, prior_val, target_prob, total_val])
-                    if (m % 5) == 0:
+                    if (m % 2) == 0:
                         print(f"[step {m}] CE={ce_val:.4f} align={align_val:.4f} LPIPS={lpips_val:.4f} prior={prior_val:.4f} prob={target_prob:.3f} total={total_val:.4f}")
                 except Exception as _e:
                     print('metrics logging error:', _e)
