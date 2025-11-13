@@ -645,8 +645,6 @@ def aesthetic_loss_fn(aesthetic_target=None,
     return loss_fn
 
 
-
-
 import torch.nn.functional as F
 
 def mechint_loss_fn(
@@ -658,56 +656,121 @@ def mechint_loss_fn(
     unit_probe: torch.Tensor,
     preprocess_to_bcos=None,
     lpips_model=None,
-    ref_im_pix_minus1_1=None,
+    ref_im_pix_minus1_1=None,   # [-1,1] tensor, optional (used for LPIPS and to compute z_ref if not provided)
+    ref_image_path: str = None, # optional path; only used to compute z_ref if needed
+    probe_raw: torch.Tensor = None,   # << NEW: unnormalized probe vector (same dim as z0)
+    z_ref: torch.Tensor = None,       # << NEW: if you already computed projection for the reference decode, pass here
     token_agg: str = "cls",
-    weights: dict = None,
+    weights: dict = None,             # add 'z_l2' here if you want it active
+    z_l2_squared: bool = True,       # if True, use squared L2; else plain L2
     grad_scale: float = 1.0
 ):
-    # weights apply ONLY to gradient contribution; we log RAW terms separately
-    w = {'ce':1.0,'probe':1.0,'lpips':0.0}
-    if weights: w.update(weights)
+    """
+    Pixel-space guidance terms (CE, alignment, LPIPS) plus a subspace target term:
+        z_star = z_ref + probe_raw
+        z_l2_raw = || z0 - z_star ||_2   (or squared if z_l2_squared)
+    Raw terms are logged in loss_fn._last_terms; weights only affect gradients.
+    """
+    w = {'ce': 1.0, 'probe': 1.0, 'lpips': 0.0, 'z_l2': 0.0}
+    if weights:
+        w.update(weights)
 
-    def _default_preprocess(x_m11):
-        # x in [-1,1] -> [0,1]; replace if your model expects [-1,1]
-        return (x_m11.clamp(-1,1) + 1.0) * 0.5
+    # robust preprocessing: prefer BCOS signature with data_range, fall back to single-arg
+    def _pre(x):
+        try:
+            return preprocess_to_bcos(x, data_range=(-1, 1)) if preprocess_to_bcos else (x.clamp(-1,1) + 1.0) * 0.5
+        except TypeError:
+            return preprocess_to_bcos(x) if preprocess_to_bcos else (x.clamp(-1,1) + 1.0) * 0.5
 
-    preprocess = preprocess_to_bcos or _default_preprocess
     target = torch.tensor([target_idx], device=device, dtype=torch.long)
 
-    # attach a dict for last raw metrics
-    def loss_fn(im_pix):  # im_pix is in [-1,1]
+    # cache for z_ref so we don’t recompute every call
+    _cache = {'z_ref': z_ref.detach() if isinstance(z_ref, torch.Tensor) else None}
+
+    # helper to compute z_ref once from a reference image if needed
+    def _ensure_z_ref():
+        if _cache['z_ref'] is not None:
+            return _cache['z_ref']
+        # try from ref_im_pix_minus1_1
+        if ref_im_pix_minus1_1 is not None:
+            with torch.no_grad():
+                x_ref = _pre(ref_im_pix_minus1_1)
+                _, acts_ref = masked_model_modal(x_ref, return_acts=True)
+                z_r = project_activations(acts_ref, subspace, method=token_agg)[0]
+                _cache['z_ref'] = z_r.detach()
+                return _cache['z_ref']
+        # try from ref_image_path
+        if ref_image_path is not None:
+            # lazily import helpers available in this module’s scope
+            from PIL import Image
+            im = load_im_into_format_from_path(ref_image_path)
+            im = im.resize((512, 512), resample=Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS)
+            im = np.array(im) / 255.0 * 2.0 - 1.0
+            im = torch.from_numpy(im[np.newaxis, ...].transpose(0, 3, 1, 2)).to(device).to(unet.dtype)
+            if im.shape[1] > 3:
+                im = im[:, :3] * im[:, 3:] + (1 - im[:, 3:])
+            with torch.no_grad():
+                x_ref = _pre(im)
+                _, acts_ref = masked_model_modal(x_ref, return_acts=True)
+                z_r = project_activations(acts_ref, subspace, method=token_agg)[0]
+                _cache['z_ref'] = z_r.detach()
+                return _cache['z_ref']
+        return None  # no reference available
+
+    def loss_fn(im_pix):  # im_pix in [-1,1]
         # (1) CE (raw)
-        x_for_bcos = preprocess(im_pix, data_range=(-1, 1))
+        x_for_bcos = _pre(im_pix)
         logits, acts = masked_model_modal(x_for_bcos, return_acts=True)
         ce_raw = F.cross_entropy(logits, target)
         with torch.no_grad():
             probs = torch.softmax(logits.float(), dim=1)
-            target_prob = probs[0, target_idx].clamp(0,1)
+            target_prob = probs[0, target_idx].clamp(0, 1)
 
         # (2) Probe alignment (raw, maximize)
         z0 = project_activations(acts, subspace, method=token_agg)[0]
-        alignment_raw = torch.dot(z0, unit_probe)        # we want this to go UP
-        probe_loss = -alignment_raw                      # loss to minimize
+        alignment_raw = torch.dot(z0, unit_probe)
+        probe_align_loss = -alignment_raw
 
-        # (3a) LPIPS (raw)
+        # (3) LPIPS (raw)
         lpips_raw = torch.zeros((), device=im_pix.device, dtype=im_pix.dtype)
         if (lpips_model is not None) and (ref_im_pix_minus1_1 is not None):
             lpips_raw = lpips_model(im_pix, ref_im_pix_minus1_1).mean()
 
-        # store raw metrics for logging (no weights, no grad_scale)
+        # (4) NEW: z-target term
+        z_l2_raw = torch.zeros((), device=z0.device, dtype=z0.dtype)
+        z_ref_here = _ensure_z_ref()
+        if (probe_raw is not None) and (z_ref_here is not None):
+            z_star = z_ref_here + probe_raw
+            diff = z0 - z_star
+            if z_l2_squared:
+                z_l2_raw = (diff * diff).sum()
+            else:
+                z_l2_raw = diff.norm(p=2)
+        # (Note: if either piece missing, the term stays zero and logs will reflect that.)
+
+        # --- log raw terms (no weights, no grad_scale) ---
         loss_fn._last_terms = {
             'ce': float(ce_raw.detach().cpu()),
             'alignment': float(alignment_raw.detach().cpu()),
             'lpips': float(lpips_raw.detach().cpu()),
             'target_prob': float(target_prob.detach().cpu()),
+            'z_l2': float(z_l2_raw.detach().cpu()),
+            'z0_norm': float(z0.detach().norm().cpu()),
+            'z_ref_norm': float(z_ref_here.norm().cpu()) if z_ref_here is not None else float('nan'),
+            'z_star_norm': float((z_ref_here + probe_raw).norm().cpu()) if (z_ref_here is not None and probe_raw is not None) else float('nan'),
         }
 
-        # weighted scalar loss (for gradients)
-        total = (w['ce']*ce_raw + w['probe']*probe_loss + w['lpips']*lpips_raw)
+        total = (
+            w['ce']   * ce_raw +
+            w['probe']* probe_align_loss +
+            w['lpips']* lpips_raw +
+            w['z_l2'] * z_l2_raw
+        )
         return grad_scale * total
 
     loss_fn._last_terms = {}
     return loss_fn
+
 
 
 def gen(
