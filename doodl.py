@@ -1104,35 +1104,49 @@ def gen(
                 # ===== Metrics logging (raw terms + weighted contributions; no grad preview here) =====
                 try:
                     # Raw (unweighted) terms from the custom loss' last call
-                    terms = getattr(loss_fn, "_last_terms", {})
+                    terms        = getattr(loss_fn, "_last_terms", {}) or {}
                     ce_val       = float(terms.get('ce', float('nan')))
                     align_val    = float(terms.get('alignment', float('nan')))  # alignment (higher is better)
                     lpips_val    = float(terms.get('lpips', float('nan')))
+                    z_l2_val     = float(terms.get('z_l2', float('nan')))       # new term (can be NaN if unused)
                     target_prob  = float(terms.get('target_prob', float('nan')))
-                    prior_val    = float(prior_loss.detach().cpu())
-                    total_val    = float(sum_loss.detach().cpu())
-
-                    # Append RAW terms CSV (keeps your existing schema)
+                    z0_norm      = float(terms.get('z0_norm', float('nan')))
+                    z_ref_norm   = float(terms.get('z_ref_norm', float('nan')))
+                    z_star_norm  = float(terms.get('z_star_norm', float('nan')))
+                
+                    # Scalars from this loop body
+                    prior_val = float(prior_loss.detach().float().cpu()) if isinstance(prior_loss, torch.Tensor) else float('nan')
+                    total_val = float(sum_loss.detach().float().cpu())
+                
+                    # Append RAW terms CSV (extends your existing schema with z_l2 and z-norms)
                     write_header = not os.path.exists(metrics_path)
                     with open(metrics_path, 'a', newline='') as f:
                         w = csv.writer(f)
                         if write_header:
-                            w.writerow(['step','ce','alignment','lpips','prior','target_prob','total_loss'])
-                        w.writerow([m, ce_val, align_val, lpips_val, prior_val, target_prob, total_val])
-
+                            w.writerow([
+                                'step','ce','alignment','lpips','z_l2','prior','target_prob','total_loss',
+                                'z0_norm','z_ref_norm','z_star_norm'
+                            ])
+                        w.writerow([
+                            m, ce_val, align_val, lpips_val, z_l2_val, prior_val, target_prob, total_val,
+                            z0_norm, z_ref_norm, z_star_norm
+                        ])
+                
                     # Weighted contributions to the optimized scalar (cached for post-backward logging)
                     weights_cfg = model_guidance_dict.get('weights', {'ce':1.0,'probe':1.0,'lpips':0.0})
-                    w_ce    = float(weights_cfg.get('ce', 1.0))
-                    w_probe = float(weights_cfg.get('probe', 1.0))
-                    w_lpips = float(weights_cfg.get('lpips', 0.0))
+                    w_ce    = float(weights_cfg.get('ce',   1.0))
+                    w_probe = float(weights_cfg.get('probe',1.0))
+                    w_lpips = float(weights_cfg.get('lpips',0.0))
                     w_prior = float(model_guidance_dict.get('latent_prior_weight', 0.0))
-
+                    w_zl2   = float(weights_cfg.get('z_l2', 0.0))   # new term weight (defaults to 0 if not provided)
+                
                     contrib_ce    = w_ce    * ce_val
-                    contrib_probe = w_probe * (-align_val)   # note sign flip because we *maximize* alignment
+                    contrib_probe = w_probe * (-align_val)   # sign flip: we *maximize* alignment
                     contrib_lpips = w_lpips * lpips_val
                     contrib_prior = w_prior * prior_val
-                    contrib_total = contrib_ce + contrib_probe + contrib_lpips + contrib_prior
-
+                    contrib_zl2   = w_zl2   * z_l2_val
+                    contrib_total = contrib_ce + contrib_probe + contrib_lpips + contrib_prior + contrib_zl2
+                
                     # cache for post-backward (grad stats)
                     _contrib_cache = {
                         'm': m,
@@ -1140,32 +1154,43 @@ def gen(
                         'contrib_probe': contrib_probe,
                         'contrib_lpips': contrib_lpips,
                         'contrib_prior': contrib_prior,
+                        'contrib_zl2': contrib_zl2,
                         'contrib_total': contrib_total,
                         'ce_val': ce_val,
                         'align_val': align_val,
                         'lpips_val': lpips_val,
+                        'z_l2_val': z_l2_val,
                         'prior_val': prior_val,
                         'target_prob': target_prob,
                         'total_val': total_val,
+                        'z0_norm': z0_norm,
+                        'z_ref_norm': z_ref_norm,
+                        'z_star_norm': z_star_norm,
                     }
                 except Exception as _e:
                     print('metrics logging error (pre-backward):', _e)
-
+                
                 
                 # Backward pass
                 sum_loss.backward()
-
+                
                 
                 # ===== Post-backward: gradient stats + contributions CSV + console print =====
                 try:
                     # Gradient w.r.t. the trainable latents now exists
                     g = orig_latent_pair.grad
                     if g is not None:
-                        grad_norm = float(g.norm().detach().cpu())
-                        grad_max  = float(g.abs().max().detach().cpu())
+                        g_det   = g.detach()
+                        grad_norm = float(g_det.norm().cpu())
+                        grad_max  = float(g_det.abs().max().cpu())
+                        if clip_grad_val is not None:
+                            g_clip = torch.clamp(g_det, -clip_grad_val, clip_grad_val)
+                            grad_norm_clip = float(g_clip.norm().cpu())
+                        else:
+                            grad_norm_clip = grad_norm
                     else:
-                        grad_norm, grad_max = float('nan'), float('nan')
-
+                        grad_norm, grad_max, grad_norm_clip = float('nan'), float('nan'), float('nan')
+                
                     # Pull cached contributions (from the pre-backward block)
                     c = locals().get('_contrib_cache', None)
                     if c is not None:
@@ -1175,20 +1200,30 @@ def gen(
                         with open(contrib_path, 'a', newline='') as f2:
                             w2 = csv.writer(f2)
                             if write_header_c:
-                                w2.writerow(['step','w*CE','w*probe(-align)','w*LPIPS','w*prior','contrib_total','grad_norm','grad_maxabs'])
-                            w2.writerow([m, c['contrib_ce'], c['contrib_probe'], c['contrib_lpips'], c['contrib_prior'],
-                                         c['contrib_total'], grad_norm, grad_max])
-
+                                w2.writerow([
+                                    'step','w*CE','w*probe(-align)','w*LPIPS','w*prior','w*z_l2','contrib_total',
+                                    'grad_norm','grad_norm_clipped','grad_maxabs',
+                                    'z0_norm','z_ref_norm','z_star_norm'
+                                ])
+                            w2.writerow([
+                                m, c['contrib_ce'], c['contrib_probe'], c['contrib_lpips'], c['contrib_prior'], c['contrib_zl2'],
+                                c['contrib_total'], grad_norm, grad_norm_clip, grad_max,
+                                c['z0_norm'], c['z_ref_norm'], c['z_star_norm']
+                            ])
+                
                         # Console print every 2 steps: raw + contributions + grad stats (scientific notation)
                         if (m % 2) == 0:
                             print(
-                                "[step %d] raw:     CE=%.3e  align=%.3e  LPIPS=%.3e  prior=%.3e  prob=%.3f  total=%.3e"
-                                % (m, c['ce_val'], c['align_val'], c['lpips_val'], c['prior_val'], c['target_prob'], c['total_val'])
-                            )
-                            print(
-                                "           contrib: w*CE=%.3e  w*probe=%.3e  w*LPIPS=%.3e  w*prior=%.3e  total=%.3e  | grad: ||g||=%.3e  max|g|=%.3e"
-                                % (c['contrib_ce'], c['contrib_probe'], c['contrib_lpips'], c['contrib_prior'],
-                                   c['contrib_total'], grad_norm, grad_max)
+                                "[step %04d] raw:     CE=%.3e  align=%.3e  LPIPS=%.3e  zL2=%.3e  prior=%.3e  prob=%.3f  total=%.3e\n"
+                                "           contrib: w*CE=%.3e  w*probe=%.3e  w*LPIPS=%.3e  w*prior=%.3e  w*zL2=%.3e  total=%.3e\n"
+                                "             norms: z0=%.3e  z_ref=%.3e  z_star=%.3e  |  ||g||=%.3e  ||g||_clip=%.3e  max|g|=%.3e"
+                                % (
+                                    m,
+                                    c['ce_val'], c['align_val'], c['lpips_val'], c['z_l2_val'], c['prior_val'], c['target_prob'], c['total_val'],
+                                    c['contrib_ce'], c['contrib_probe'], c['contrib_lpips'], c['contrib_prior'], c['contrib_zl2'], c['contrib_total'],
+                                    c['z0_norm'], c['z_ref_norm'], c['z_star_norm'],
+                                    grad_norm, grad_norm_clip, grad_max
+                                )
                             )
                 except Exception as _e:
                     print('metrics logging error (post-backward):', _e)
