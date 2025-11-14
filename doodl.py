@@ -740,13 +740,15 @@ def mechint_loss_fn(
         z_l2_raw = torch.zeros((), device=z0.device, dtype=z0.dtype)
         z_ref_here = _ensure_z_ref()
         if (probe_raw is not None) and (z_ref_here is not None):
-            z_star = z_ref_here + probe_raw
-            diff = z0 - z_star
-            if z_l2_squared:
-                z_l2_raw = (diff * diff).sum()
+            pr = probe_raw
+            if isinstance(pr, torch.Tensor):
+                pr = pr.to(device=z_ref_here.device, dtype=z_ref_here.dtype)
             else:
-                z_l2_raw = diff.norm(p=2)
-        # (Note: if either piece missing, the term stays zero and logs will reflect that.)
+                # allow list/np -> torch
+                pr = torch.as_tensor(pr, device=z_ref_here.device, dtype=z_ref_here.dtype)
+            z_star = z_ref_here + pr
+            diff = z0 - z_star
+            z_l2_raw = (diff * diff).sum() if z_l2_squared else diff.norm(p=2)
 
         # --- log raw terms (no weights, no grad_scale) ---
         loss_fn._last_terms = {
@@ -757,7 +759,7 @@ def mechint_loss_fn(
             'z_l2': float(z_l2_raw.detach().cpu()),
             'z0_norm': float(z0.detach().norm().cpu()),
             'z_ref_norm': float(z_ref_here.norm().cpu()) if z_ref_here is not None else float('nan'),
-            'z_star_norm': float((z_ref_here + probe_raw).norm().cpu()) if (z_ref_here is not None and probe_raw is not None) else float('nan'),
+            'z_star_norm': float(z_star.norm().cpu()) if (z_ref_here is not None and 'z_star' in locals()) else float('nan'),
         }
 
         total = (
@@ -939,7 +941,9 @@ def gen(
                 unit_probe         = model_guidance_dict['unit_probe'],
                 preprocess_to_bcos = model_guidance_dict.get('preprocess_to_bcos', None),
                 lpips_model        = model_guidance_dict.get('lpips_model', None),
-                ref_im_pix_minus1_1= ref_im_pix,
+                ref_im_pix_minus1_1= ref_im_pix,  # stays as-is
+                ref_image_path     = model_guidance_dict.get('ref_image_path', None),  # NEW (optional)
+                probe_raw          = model_guidance_dict.get('probe_raw', None),       # NEW (required for zL2)
                 token_agg          = model_guidance_dict.get('token_agg', 'cls'),
                 weights            = model_guidance_dict.get('weights', {'ce':1.0,'probe':1.0,'lpips':0.0}),
                 grad_scale         = grad_scale
