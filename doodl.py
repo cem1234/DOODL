@@ -803,7 +803,8 @@ def gen(
     opt_t=None,
     perturb_grad_scale=1e-4,
     clip_grad_val=1e-3,
-    source_im=None
+    source_im=None,
+    save_dir=None
     ):
     """
     Our main function which takes in all of the conditioning and hyperparameters
@@ -863,6 +864,11 @@ def gen(
     generator = torch.cuda.manual_seed(seed)
     torch.manual_seed(seed)
     random.seed(seed)
+    # Output directory for images/logs
+    if save_dir is None:
+        save_dir = 'ims'
+    os.makedirs(save_dir, exist_ok=True)
+
     
     # Text embedding setup
     with torch.autocast('cuda', dtype=torch_dtype):
@@ -1051,8 +1057,7 @@ def gen(
         """
         # turn on gradient calculation
         with torch.enable_grad(): # important b/c don't have on by default in module
-            metrics_path = f"ims/{save_str.replace('.png','_metrics.csv') if save_str else 'metrics.csv'}"
-            os.makedirs('ims', exist_ok=True)
+            metrics_path = os.path.join(save_dir, save_str.replace('.png','_metrics.csv') if save_str else 'metrics.csv')
             latent_ref_anchor = latent_pair.detach().clone()
             for m in range(num_traversal_steps): # This is # of optimization steps
                 print(f"Optimization Step {m}")
@@ -1087,7 +1092,7 @@ def gen(
                     
                     # save
                     if ( (m%save_interval)==0 or m==(num_traversal_steps-1) ) and im_i==0: 
-                        pil_im.save(f'ims/{mod_save_str}')
+                        pil_im.save(os.path.join(save_dir, mod_save_str))
                         
                     # If guiding then compute loss    
                     if grad_scale!=0:
@@ -1350,6 +1355,6 @@ def gen(
         # decode and save
         decoded_latent = vae.decode(latent_pair[:1].to(vae.dtype) / 0.18215).sample
         pil_im = prep_image_for_return(decoded_latent.detach())
-        if save_str: pil_im.save(f'ims/{save_str}')
+        if save_str: pil_im.save(os.path.join(save_dir, save_str))
     return 
 
