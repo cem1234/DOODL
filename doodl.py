@@ -660,20 +660,29 @@ def mechint_loss_fn(
     ref_image_path: str = None, # optional path; only used to compute z_ref if needed
     probe_raw: torch.Tensor = None,   # << NEW: unnormalized probe vector (same dim as z0)
     z_ref: torch.Tensor = None,       # << NEW: if you already computed projection for the reference decode, pass here
+    boundary_w: torch.Tensor = None,
+    boundary_b: float = None,
+    boundary_target: torch.Tensor = None,
+    boundary_mode: str = "l2",
+    boundary_target_mode: str = "point",
     token_agg: str = "cls",
     weights: dict = None,             # add 'z_l2' here if you want it active
     z_l2_squared: bool = True,       # if True, use squared L2; else plain L2
     grad_scale: float = 1.0
 ):
     """
-    Pixel-space guidance terms (CE, alignment, LPIPS) plus a subspace target term:
+    Pixel-space guidance terms (CE, alignment, LPIPS) plus subspace targets:
         z_star = z_ref + probe_raw
         z_l2_raw = || z0 - z_star ||_2   (or squared if z_l2_squared)
+        boundary_raw = distance to boundary target (point) or |w dot z0 + b| (distance)
     Raw terms are logged in loss_fn._last_terms; weights only affect gradients.
     """
-    w = {'ce': 1.0, 'probe': 1.0, 'lpips': 0.0, 'z_l2': 0.0}
+    w = {'ce': 1.0, 'probe': 1.0, 'lpips': 0.0, 'z_l2': 0.0, 'boundary': 0.0}
     if weights:
         w.update(weights)
+
+    boundary_mode = (boundary_mode or "l2").lower()
+    boundary_target_mode = (boundary_target_mode or "point").lower()
 
     # robust preprocessing: prefer BCOS signature with data_range, fall back to single-arg
     def _pre(x):
@@ -750,6 +759,38 @@ def mechint_loss_fn(
             diff = z0 - z_star
             z_l2_raw = (diff * diff).sum() if z_l2_squared else diff.norm(p=2)
 
+        # (5) Boundary term (optional)
+        boundary_raw = torch.zeros((), device=z0.device, dtype=z0.dtype)
+        boundary_signed = None
+        boundary_distance = None
+        if boundary_target_mode == "distance":
+            if (boundary_w is not None) and (boundary_b is not None):
+                bw = boundary_w
+                if not isinstance(bw, torch.Tensor):
+                    bw = torch.as_tensor(bw, device=z0.device, dtype=z0.dtype)
+                else:
+                    bw = bw.to(device=z0.device, dtype=z0.dtype)
+                bb = torch.as_tensor(boundary_b, device=z0.device, dtype=z0.dtype)
+                signed = torch.dot(z0, bw) + bb
+                boundary_signed = signed
+                boundary_distance = signed.abs()
+                if boundary_mode == "l1":
+                    boundary_raw = boundary_distance
+                else:
+                    boundary_raw = boundary_distance * boundary_distance
+        else:
+            if boundary_target is not None:
+                bt = boundary_target
+                if not isinstance(bt, torch.Tensor):
+                    bt = torch.as_tensor(bt, device=z0.device, dtype=z0.dtype)
+                else:
+                    bt = bt.to(device=z0.device, dtype=z0.dtype)
+                diff_b = z0 - bt
+                if boundary_mode == "l1":
+                    boundary_raw = diff_b.abs().sum()
+                else:
+                    boundary_raw = (diff_b * diff_b).sum()
+
         # --- log raw terms (no weights, no grad_scale) ---
         loss_fn._last_terms = {
             'ce': float(ce_raw.detach().cpu()),
@@ -757,6 +798,9 @@ def mechint_loss_fn(
             'lpips': float(lpips_raw.detach().cpu()),
             'target_prob': float(target_prob.detach().cpu()),
             'z_l2': float(z_l2_raw.detach().cpu()),
+            'boundary': float(boundary_raw.detach().cpu()),
+            'boundary_signed': float(boundary_signed.detach().cpu()) if boundary_signed is not None else float('nan'),
+            'boundary_distance': float(boundary_distance.detach().cpu()) if boundary_distance is not None else float('nan'),
             'z0_norm': float(z0.detach().norm().cpu()),
             'z_ref_norm': float(z_ref_here.norm().cpu()) if z_ref_here is not None else float('nan'),
             'z_star_norm': float(z_star.norm().cpu()) if (z_ref_here is not None and 'z_star' in locals()) else float('nan'),
@@ -766,7 +810,8 @@ def mechint_loss_fn(
             w['ce']   * ce_raw +
             w['probe']* probe_align_loss +
             w['lpips']* lpips_raw +
-            w['z_l2'] * z_l2_raw
+            w['z_l2'] * z_l2_raw +
+            w['boundary'] * boundary_raw
         )
         return grad_scale * total
 
@@ -950,6 +995,11 @@ def gen(
                 ref_im_pix_minus1_1= ref_im_pix,  # stays as-is
                 ref_image_path     = model_guidance_dict.get('ref_image_path', None),  # NEW (optional)
                 probe_raw          = model_guidance_dict.get('probe_raw', None),       # NEW (required for zL2)
+                boundary_w         = model_guidance_dict.get('boundary_w', None),
+                boundary_b         = model_guidance_dict.get('boundary_b', None),
+                boundary_target    = model_guidance_dict.get('boundary_target', None),
+                boundary_mode      = model_guidance_dict.get('boundary_mode', 'l2'),
+                boundary_target_mode = model_guidance_dict.get('boundary_target_mode', 'point'),
                 token_agg          = model_guidance_dict.get('token_agg', 'cls'),
                 weights            = model_guidance_dict.get('weights', {'ce':1.0,'probe':1.0,'lpips':0.0}),
                 grad_scale         = grad_scale
