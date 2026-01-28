@@ -1,0 +1,11 @@
+
+[deps]
+numpy
+Pillow
+imageio
+tqdm
+omegaconf
+transformers
+open-clip-torch
+torch
+torchvision
